@@ -20,18 +20,21 @@ import pb "go.etcd.io/etcd/raft/v3/raftpb"
 // Note that unstable.offset may be less than the highest log
 // position in storage; this means that the next write to storage
 // might need to truncate the log before persisting unstable.entries.
+// 节点刚收到的记录都先存储在Unstable中
 type unstable struct {
 	// the incoming unstable snapshot, if any.
 	snapshot *pb.Snapshot
 	// all entries that have not yet been written to storage.
 	entries []pb.Entry
-	offset  uint64
+	// entry中第一条记录的索引
+	offset uint64
 
 	logger Logger
 }
 
 // maybeFirstIndex returns the index of the first possible entry in entries
 // if it has a snapshot.
+// why？不理解啊
 func (u *unstable) maybeFirstIndex() (uint64, bool) {
 	if u.snapshot != nil {
 		return u.snapshot.Metadata.Index + 1, true
@@ -41,6 +44,8 @@ func (u *unstable) maybeFirstIndex() (uint64, bool) {
 
 // maybeLastIndex returns the last index if it has at least one
 // unstable entry or snapshot.
+// 所以看这个样子最早的在snapshot中，最迟的在entry中。如果entry有值，从entry返回
+// 否则从snapshot中找数据的索引
 func (u *unstable) maybeLastIndex() (uint64, bool) {
 	if l := len(u.entries); l != 0 {
 		return u.offset + uint64(l) - 1, true
@@ -55,6 +60,7 @@ func (u *unstable) maybeLastIndex() (uint64, bool) {
 // is any.
 func (u *unstable) maybeTerm(i uint64) (uint64, bool) {
 	if i < u.offset {
+		// 不在entry中，可能在snapshot，可能被持久化进storage了
 		if u.snapshot != nil && u.snapshot.Metadata.Index == i {
 			return u.snapshot.Metadata.Term, true
 		}
@@ -65,6 +71,7 @@ func (u *unstable) maybeTerm(i uint64) (uint64, bool) {
 	if !ok {
 		return 0, false
 	}
+	// 一份来自'未来'的数据
 	if i > last {
 		return 0, false
 	}
@@ -72,7 +79,10 @@ func (u *unstable) maybeTerm(i uint64) (uint64, bool) {
 	return u.entries[i-u.offset].Term, true
 }
 
+// 当数据持久化入storage中时，清理entry中的记录
+// 输入是索引值和任期值
 func (u *unstable) stableTo(i, t uint64) {
+	// 如果找不到索引对应的任期，说明记录不在unstable中，直接返回
 	gt, ok := u.maybeTerm(i)
 	if !ok {
 		return
@@ -80,9 +90,11 @@ func (u *unstable) stableTo(i, t uint64) {
 	// if i < offset, term is matched with the snapshot
 	// only update the unstable entries if term is matched with
 	// an unstable entry.
+	// 如果i < offset，要不在snapshot中，要不持久化了，不用管
 	if gt == t && i >= u.offset {
 		u.entries = u.entries[i+1-u.offset:]
 		u.offset = i + 1
+		// 当cap > 2 * len时，释放内存，等于C艹的std vector的行为
 		u.shrinkEntriesArray()
 	}
 }
@@ -118,19 +130,23 @@ func (u *unstable) restore(s pb.Snapshot) {
 	u.snapshot = &s
 }
 
+// 和memory storage里一样，看entry和现有记录的重叠程度
 func (u *unstable) truncateAndAppend(ents []pb.Entry) {
 	after := ents[0].Index
 	switch {
+	// 太好了，可以直接添加新的entry
 	case after == u.offset+uint64(len(u.entries)):
 		// after is the next index in the u.entries
 		// directly append
 		u.entries = append(u.entries, ents...)
+	// 全部重叠了，直接覆盖
 	case after <= u.offset:
 		u.logger.Infof("replace the unstable entries from index %d", after)
 		// The log is being truncated to before our current offset
 		// portion, so set the offset and replace the entries
 		u.offset = after
 		u.entries = ents
+	// 重叠了部分，覆盖这部分，再追加新的内容
 	default:
 		// truncate to after and copy to u.entries
 		// then append
