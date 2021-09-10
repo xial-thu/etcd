@@ -28,6 +28,8 @@ import (
 // strewn around `*raft.raft`. Additionally, some fields are only used when in a
 // certain State. All of this isn't ideal.
 type Progress struct {
+	// match: follower节点成功复制的entry的索引值
+	// next: follower节点待复制的索引值
 	Match, Next uint64
 	// State defines how the leader should interact with the follower.
 	//
@@ -54,6 +56,7 @@ type Progress struct {
 	// RecentActive can be reset to false after an election timeout.
 	//
 	// TODO(tbg): the leader should always have this set to true.
+	// 从leader看起来，follower节点是否存活
 	RecentActive bool
 
 	// ProbeSent is used while this follower is in StateProbe. When ProbeSent is

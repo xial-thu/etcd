@@ -117,8 +117,10 @@ func (c *Config) Clone() Config {
 type ProgressTracker struct {
 	Config
 
+	// 记录日志复制情况
 	Progress ProgressMap
 
+	// 统计当前节点收到的投票
 	Votes map[uint64]bool
 
 	MaxInflight int

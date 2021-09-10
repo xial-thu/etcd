@@ -105,6 +105,9 @@ var stmap = [...]string{
 	"StateFollower",
 	"StateCandidate",
 	"StateLeader",
+	// 系统出现分区，某个被分割的follower的term会无限制增长，分区结束后，由于任期更高，会被选为leader
+	// 但在分割的过程中，其日志是落后其他节点的，所以无法成为leader。这种情况就需要pre candidate状态
+	// 当节点满足成为Leader的前提：能与半数以上节点通信。否则不会发起选主
 	"StatePreCandidate",
 }
 
@@ -113,6 +116,7 @@ func (st StateType) String() string {
 }
 
 // Config contains the parameters to start a raft.
+// raft节点初始化时的参数配置项
 type Config struct {
 	// ID is the identity of the local raft. ID cannot be 0.
 	ID uint64
@@ -123,16 +127,19 @@ type Config struct {
 	// candidate and start an election. ElectionTick must be greater than
 	// HeartbeatTick. We suggest ElectionTick = 10 * HeartbeatTick to avoid
 	// unnecessary leader switching.
+	// 影响raft.electionTimeout
 	ElectionTick int
 	// HeartbeatTick is the number of Node.Tick invocations that must pass between
 	// heartbeats. That is, a leader sends heartbeat messages to maintain its
 	// leadership every HeartbeatTick ticks.
+	// 影响raft.heartbeatTimeout
 	HeartbeatTick int
 
 	// Storage is the storage for raft. raft generates entries and states to be
 	// stored in storage. raft reads the persisted entries and states out of
 	// Storage when it needs. raft reads out the previous state and configuration
 	// out of storage when restarting.
+	// raft的存储层
 	Storage Storage
 	// Applied is the last applied index. It should only be set when restarting
 	// raft. raft will not return entries to the application smaller or equal to
@@ -145,6 +152,7 @@ type Config struct {
 	// during normal operation). On the other side, it might affect the
 	// throughput during normal replication. Note: math.MaxUint64 for unlimited,
 	// 0 for at most one entry per message.
+	// 初始化raft.maxMsgSize
 	MaxSizePerMsg uint64
 	// MaxCommittedSizePerReady limits the size of the committed entries which
 	// can be applied.
@@ -159,15 +167,18 @@ type Config struct {
 	// has its own sending buffer over TCP/UDP. Setting MaxInflightMsgs to avoid
 	// overflowing that sending buffer. TODO (xiangli): feedback to application to
 	// limit the proposal rate?
+	// 初始化raft.maxInFlight
 	MaxInflightMsgs int
 
 	// CheckQuorum specifies if the leader should check quorum activity. Leader
 	// steps down when quorum is not active for an electionTimeout.
+	// 初始化raft.checkQuorum
 	CheckQuorum bool
 
 	// PreVote enables the Pre-Vote algorithm described in raft thesis section
 	// 9.6. This prevents disruption when a node that has been partitioned away
 	// rejoins the cluster.
+	// 是否开启prevote特性
 	PreVote bool
 
 	// ReadOnlyOption specifies how the read only request is processed.
@@ -185,6 +196,7 @@ type Config struct {
 
 	// Logger is the logger used for raft log. For multinode which can host
 	// multiple raft group, each raft group can have its own logger
+	// 传递日志句柄
 	Logger Logger
 
 	// DisableProposalForwarding set to true means that followers will drop
@@ -195,6 +207,7 @@ type Config struct {
 	// should be disabled to prevent a follower with an inaccurate hybrid
 	// logical clock from assigning the timestamp and then forwarding the data
 	// to the leader.
+	// 设置为true时，follower收到的消息将不会被转发给leader，否则将转发给leader
 	DisableProposalForwarding bool
 }
 
@@ -240,33 +253,43 @@ func (c *Config) validate() error {
 	return nil
 }
 
+// raft封装了节点的核心数据
 type raft struct {
+	// 节点在及集群中的id
 	id uint64
 
+	// 当前任期号
 	Term uint64
+	// 本节点在当前任期中投票给的节点的id
 	Vote uint64
 
 	readStates []ReadState
 
 	// the log
+	// 本地日志
 	raftLog *raftLog
 
+	// 每条消息最大字节数
 	maxMsgSize         uint64
 	maxUncommittedSize uint64
 	// TODO(tbg): rename to trk.
+	// leader节点维护的其余follwer的状态
 	prs tracker.ProgressTracker
 
+	// 当前节点的状态
 	state StateType
 
 	// isLearner is true if the local raft node is a learner.
 	isLearner bool
 
+	// 当前节点等待发送的消息
 	msgs []pb.Message
 
 	// the leader id
 	lead uint64
 	// leadTransferee is id of the leader transfer target when its value is not zero.
 	// Follow the procedure defined in raft thesis 3.10.
+	// leader转移的目标
 	leadTransferee uint64
 	// Only one conf change may be pending (in the log, but not yet
 	// applied) at a time. This is enforced via pendingConfIndex, which
@@ -286,14 +309,18 @@ type raft struct {
 	// or candidate.
 	// number of ticks since it reached last electionTimeout or received a
 	// valid message from current leader when it is a follower.
+	// 选主的计时器
 	electionElapsed int
 
 	// number of ticks since it reached last heartbeatTimeout.
 	// only leader keeps heartbeatElapsed.
+	// 心跳计时器
 	heartbeatElapsed int
 
+	// 每隔一段时间，leader向节点发送心跳，如果收到的回复不超过半数，则leader将自己切换为follower
 	checkQuorum bool
-	preVote     bool
+	// 在preCandiate状态的注释里
+	preVote bool
 
 	heartbeatTimeout int
 	electionTimeout  int
@@ -303,7 +330,9 @@ type raft struct {
 	randomizedElectionTimeout int
 	disableProposalForwarding bool
 
+	// 推动逻辑时钟的函数
 	tick func()
+	// 节点收到消息的处理函数
 	step stepFunc
 
 	logger Logger
