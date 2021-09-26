@@ -30,6 +30,7 @@ type Inflights struct {
 
 	// buffer contains the index of the last entry
 	// inside one message.
+	// buffer被当做环形数组使用，避免频繁的内存变动
 	buffer []uint64
 }
 
@@ -62,6 +63,7 @@ func (in *Inflights) Add(inflight uint64) {
 		next -= size
 	}
 	if next >= len(in.buffer) {
+		// buffer不是一开始就分配好的，和C++ std一样，成倍增长，但这里没有缩小空间的函数
 		in.grow()
 	}
 	in.buffer[next] = inflight

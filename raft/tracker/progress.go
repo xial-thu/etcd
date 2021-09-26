@@ -144,11 +144,15 @@ func (pr *Progress) BecomeSnapshot(snapshoti uint64) {
 // MaybeUpdate is called when an MsgAppResp arrives from the follower, with the
 // index acked by it. The method returns false if the given n index comes from
 // an outdated message. Otherwise it updates the progress and returns true.
+// 判断条件是match小于msgAppResp中的committed值。因为如果本地记录的match值比此次response传回
+// 的值还要大，说明发送的是一条过时的entry复制消息
 func (pr *Progress) MaybeUpdate(n uint64) bool {
 	var updated bool
 	if pr.Match < n {
+		// 说明成功写入对应节点的raft log中了，节点是updated
 		pr.Match = n
 		updated = true
+		// laeder可以继续向这个节点复制entry记录
 		pr.ProbeAcked()
 	}
 	pr.Next = max(pr.Next, n+1)
@@ -174,22 +178,26 @@ func (pr *Progress) MaybeDecrTo(rejected, matchHint uint64) bool {
 	if pr.State == StateReplicate {
 		// The rejection must be stale if the progress has matched and "rejected"
 		// is smaller than "match".
+		// 过时的消息，直接忽略
 		if rejected <= pr.Match {
 			return false
 		}
 		// Directly decrease next to match + 1.
 		//
 		// TODO(tbg): why not use matchHint if it's larger?
+		// replicate状态下，我们尽可能多的复制消息。而由于消息被拒绝了，将next重置为match+1
 		pr.Next = pr.Match + 1
 		return true
 	}
 
 	// The rejection must be stale if "rejected" does not match next - 1. This
 	// is because non-replicating followers are probed one entry at a time.
+	// 这也是一条过时的消息
 	if pr.Next-1 != rejected {
 		return false
 	}
 
+	// rejected是被拒绝的索引，hint是follower建议的索引，选较小的那个
 	pr.Next = max(min(rejected, matchHint+1), 1)
 	pr.ProbeSent = false
 	return true
@@ -201,11 +209,17 @@ func (pr *Progress) MaybeDecrTo(rejected, matchHint uint64) bool {
 // operation, this is false. A throttled node will be contacted less frequently
 // until it has reached a state in which it's able to accept a steady stream of
 // log entries again.
+// State分为三种：replicate, probe和snapshot。replicate代表正常状态，节点处于这个状态时，leader发送
+// entry记录后不需要等待回复，可继续发送下一批记录。probe字面是探针的意思，处在这个状态时，代表leader只能
+// FIFO的发送请求，发送后等待响应，才能继续发送；有三种情况可能造成probe状态：刚复制完快照数据、上次msgApp请求被拒绝或失败、
+// leader节点初始化。snapshot状态代表leader节点正在向目标节点发送快照数据。
 func (pr *Progress) IsPaused() bool {
 	switch pr.State {
 	case StateProbe:
+		// 如果探针信息发送完毕，确认节点存活之后，就可以继续发送了，否则要等待探针发送或收到回复
 		return pr.ProbeSent
 	case StateReplicate:
+		// 有一个buffer，如果对方迟迟不处理，导致inflight满了，肯定不能继续无限制的发送
 		return pr.Inflights.Full()
 	case StateSnapshot:
 		return true
