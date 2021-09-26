@@ -708,9 +708,11 @@ func (r *raft) tickHeartbeat() {
 	r.heartbeatElapsed++
 	r.electionElapsed++
 
+	// 选举超时了，将选主计时器重置
 	if r.electionElapsed >= r.electionTimeout {
 		r.electionElapsed = 0
 		if r.checkQuorum {
+			// term为0，属于内部消息，不会真正发送给其他节点
 			r.Step(pb.Message{From: r.id, Type: pb.MsgCheckQuorum})
 		}
 		// If current leader cannot transfer leadership in electionTimeout, it becomes leader again.
@@ -1064,9 +1066,11 @@ type stepFunc func(r *raft, m pb.Message) error
 func stepLeader(r *raft, m pb.Message) error {
 	// These message types do not require any progress for m.From.
 	switch m.Type {
+	// leader向follower发送心跳包
 	case pb.MsgBeat:
 		r.bcastHeartbeat()
 		return nil
+	// leader的选主计时器超时后，进入这里的流程
 	case pb.MsgCheckQuorum:
 		// The leader should always see itself as active. As a precaution, handle
 		// the case in which the leader isn't in the configuration any more (for
@@ -1077,36 +1081,44 @@ func stepLeader(r *raft, m pb.Message) error {
 		if pr := r.prs.Progress[r.id]; pr != nil {
 			pr.RecentActive = true
 		}
+		// 如果没有超过半数的active节点，leader进入follower状态，判断依据是leader维护的process表
 		if !r.prs.QuorumActive() {
 			r.logger.Warningf("%x stepped down to follower since quorum is not active", r.id)
 			r.becomeFollower(r.Term, None)
 		}
 		// Mark everyone (but ourselves) as inactive in preparation for the next
 		// CheckQuorum.
+		// 然后把每个节点都标记为非active
 		r.prs.Visit(func(id uint64, pr *tracker.Progress) {
 			if id != r.id {
 				pr.RecentActive = false
 			}
 		})
 		return nil
+	// leader收到follower的写请求
 	case pb.MsgProp:
+		// 不允许空的记录
 		if len(m.Entries) == 0 {
 			r.logger.Panicf("%x stepped empty MsgProp", r.id)
 		}
+		// leader节点不再是集群的一份子
 		if r.prs.Progress[r.id] == nil {
 			// If we are not currently a member of the range (i.e. this node
 			// was removed from the configuration while serving as leader),
 			// drop any new proposals.
 			return ErrProposalDropped
 		}
+		// 正在发生leader转移
 		if r.leadTransferee != None {
 			r.logger.Debugf("%x [term %d] transfer leadership to %x is in progress; dropping proposal", r.id, r.Term, r.leadTransferee)
 			return ErrProposalDropped
 		}
+		// 上述情况都不允许处于写请求，返回错误是'ErrProposalDropped'
 
 		for i := range m.Entries {
 			e := &m.Entries[i]
 			var cc pb.ConfChangeI
+			// 如果存在conf change的消息
 			if e.Type == pb.EntryConfChange {
 				var ccc pb.ConfChange
 				if err := ccc.Unmarshal(e.Data); err != nil {
@@ -1121,11 +1133,13 @@ func stepLeader(r *raft, m pb.Message) error {
 				cc = ccc
 			}
 			if cc != nil {
+				// 如果pending conf的索引比raft log中已应用的索引大，说明这个conf change尚未被处理
 				alreadyPending := r.pendingConfIndex > r.raftLog.applied
 				alreadyJoint := len(r.prs.Config.Voters[1]) > 0
 				wantsLeaveJoint := len(cc.AsV2().Changes) == 0
 
 				var refused string
+				// 禁止同时处理多个conf change
 				if alreadyPending {
 					refused = fmt.Sprintf("possible unapplied conf change at index %d (applied to %d)", r.pendingConfIndex, r.raftLog.applied)
 				} else if alreadyJoint && !wantsLeaveJoint {
@@ -1138,14 +1152,17 @@ func stepLeader(r *raft, m pb.Message) error {
 					r.logger.Infof("%x ignoring conf change %v at config %s: %s", r.id, cc, r.prs.Config, refused)
 					m.Entries[i] = pb.Entry{Type: pb.EntryNormal}
 				} else {
+					// 配置pending conf index
 					r.pendingConfIndex = r.raftLog.lastIndex() + uint64(i) + 1
 				}
 			}
 		}
 
+		// 把记录追加到自身的raft log中
 		if !r.appendEntry(m.Entries...) {
 			return ErrProposalDropped
 		}
+		// leader已经处理完写请求，马上同步给所有的follower
 		r.bcastAppend()
 		return nil
 	case pb.MsgReadIndex:
@@ -1371,6 +1388,7 @@ func stepLeader(r *raft, m pb.Message) error {
 			}
 		}
 	case pb.MsgHeartbeatResp:
+		// 收到心跳包的时候，节点是active的
 		pr.RecentActive = true
 		pr.ProbeSent = false
 
@@ -1378,6 +1396,7 @@ func stepLeader(r *raft, m pb.Message) error {
 		if pr.State == tracker.StateReplicate && pr.Inflights.Full() {
 			pr.Inflights.FreeFirstOne()
 		}
+		// 如果对方是存活的，且leader有entry没有复制过去，直接开始复制
 		if pr.Match < r.raftLog.lastIndex() {
 			r.sendAppend(m.From)
 		}
@@ -1475,6 +1494,7 @@ func stepCandidate(r *raft, m pb.Message) error {
 		myVoteRespType = pb.MsgVoteResp
 	}
 	switch m.Type {
+	// candidate将忽略follower的写请求
 	case pb.MsgProp:
 		r.logger.Infof("%x no leader at term %d; dropping proposal", r.id, r.Term)
 		return ErrProposalDropped
@@ -1515,6 +1535,7 @@ func stepCandidate(r *raft, m pb.Message) error {
 
 func stepFollower(r *raft, m pb.Message) error {
 	switch m.Type {
+	// follower收到写请求时，转发给leader
 	case pb.MsgProp:
 		if r.lead == None {
 			r.logger.Infof("%x no leader at term %d; dropping proposal", r.id, r.Term)
@@ -1525,6 +1546,7 @@ func stepFollower(r *raft, m pb.Message) error {
 		}
 		m.To = r.lead
 		r.send(m)
+	// 收到msgApp时，处理entry复制请求
 	case pb.MsgApp:
 		r.electionElapsed = 0
 		r.lead = m.From // 覆盖lead值
@@ -1608,6 +1630,7 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 	}
 }
 
+// 更新自己的commit值为leader的commit值，leader发送消息时，确认follower节点有committed之前的全部记录
 func (r *raft) handleHeartbeat(m pb.Message) {
 	r.raftLog.commitTo(m.Commit)
 	r.send(pb.Message{To: m.From, Type: pb.MsgHeartbeatResp, Context: m.Context})
