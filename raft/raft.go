@@ -1426,6 +1426,7 @@ func stepLeader(r *raft, m pb.Message) error {
 				r.send(resp)
 			}
 		}
+	// 这是发送snapshot异常的处理函数
 	case pb.MsgSnapStatus:
 		if pr.State != tracker.StateSnapshot {
 			return nil
@@ -1448,6 +1449,7 @@ func stepLeader(r *raft, m pb.Message) error {
 		// out the next MsgApp.
 		// If snapshot failure, wait for a heartbeat interval before next try
 		pr.ProbeSent = true
+	// 这是发送snapshot异常的处理函数，将目标节点状态转为probe
 	case pb.MsgUnreachable:
 		// During optimistic replication, if the remote becomes unreachable,
 		// there is huge probability that a MsgApp is lost.
@@ -1566,9 +1568,12 @@ func stepFollower(r *raft, m pb.Message) error {
 		r.electionElapsed = 0
 		r.lead = m.From
 		r.handleHeartbeat(m)
+	// follower的数据过于陈旧，无法直接添加entry，从snapshot中恢复
 	case pb.MsgSnap:
+		// 重置选主计时器，防止发生选举
 		r.electionElapsed = 0
 		r.lead = m.From
+		// 从snapshot中重建raft log
 		r.handleSnapshot(m)
 	case pb.MsgTransferLeader:
 		if r.lead == None {
@@ -1649,6 +1654,8 @@ func (r *raft) handleHeartbeat(m pb.Message) {
 	r.send(pb.Message{To: m.From, Type: pb.MsgHeartbeatResp, Context: m.Context})
 }
 
+// 从snapshot中重建raft log，发送的response均是MsgAppResp，携带的index是最后一条确认的index
+// 如果恢复成功，返回last index，因为这个时候last index就是committed值。失败返回自己的committed值
 func (r *raft) handleSnapshot(m pb.Message) {
 	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
 	if r.restore(m.Snapshot) {
@@ -1665,6 +1672,9 @@ func (r *raft) handleSnapshot(m pb.Message) {
 // restore recovers the state machine from a snapshot. It restores the log and the
 // configuration of state machine. If this method returns false, the snapshot was
 // ignored, either because it was obsolete or because of an error.
+// 通过快照重建raft log，成功的条件是：1. snapshot的index大于raft log的committed值；
+// 2. 节点此时处于follower状态，如果不是，将强制转为follower
+// 3. 节点的log中不存在与snapshot metadata一致的数据，否则snapshot应当被丢弃
 func (r *raft) restore(s pb.Snapshot) bool {
 	if s.Metadata.Index <= r.raftLog.committed {
 		return false
@@ -1715,6 +1725,7 @@ func (r *raft) restore(s pb.Snapshot) bool {
 
 	// Now go ahead and actually restore.
 
+	// 不能match，一旦match，说明可以继续复制数据，不需要从snapshot中恢复
 	if r.raftLog.matchTerm(s.Metadata.Index, s.Metadata.Term) {
 		r.logger.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] fast-forwarded commit to snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
@@ -1722,6 +1733,7 @@ func (r *raft) restore(s pb.Snapshot) bool {
 		return false
 	}
 
+	// 真正重建数据
 	r.raftLog.restore(s)
 
 	// Reset the configuration and add the (potentially updated) peers in anew.

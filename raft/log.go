@@ -366,6 +366,7 @@ func (l *raftLog) maybeCommit(maxIndex, term uint64) bool {
 	return false
 }
 
+// 从snapshot中恢复时，committed回滚为snapshot的索引
 func (l *raftLog) restore(s pb.Snapshot) {
 	l.logger.Infof("log [%s] starts to restore snapshot [index: %d, term: %d]", l, s.Metadata.Index, s.Metadata.Term)
 	l.committed = s.Metadata.Index
