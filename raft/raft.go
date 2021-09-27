@@ -1386,6 +1386,8 @@ func stepLeader(r *raft, m pb.Message) error {
 				for r.maybeSendAppend(m.From, false) {
 				}
 				// Transfer leadership is in progress.
+				// 发起leader转移时，如果目标节点数据不一致，leader会发msgApp进行entry复制，收到回复后
+				// 再发送msgTimeoutNow，让follower发起选主
 				if m.From == r.leadTransferee && pr.Match == r.raftLog.lastIndex() {
 					r.logger.Infof("%x sent MsgTimeoutNow to %x after received MsgAppResp", r.id, m.From)
 					r.sendTimeoutNow(m.From)
@@ -1457,12 +1459,16 @@ func stepLeader(r *raft, m pb.Message) error {
 			pr.BecomeProbe()
 		}
 		r.logger.Debugf("%x failed to send message to %x because it is unreachable [%s]", r.id, m.From, pr)
+	// leader可能给发起一次leader transfer
 	case pb.MsgTransferLeader:
+		// 不会给leader节点发
 		if pr.IsLearner {
 			r.logger.Debugf("%x is learner. Ignored transferring leadership", r.id)
 			return nil
 		}
+		// from字段记在了目标follower节点的id
 		leadTransferee := m.From
+		// 可能有一次未完成的leader转移操作
 		lastLeadTransferee := r.leadTransferee
 		if lastLeadTransferee != None {
 			if lastLeadTransferee == leadTransferee {
@@ -1470,6 +1476,7 @@ func stepLeader(r *raft, m pb.Message) error {
 					r.id, r.Term, leadTransferee, leadTransferee)
 				return nil
 			}
+			// 不能同时处理多个leader转移
 			r.abortLeaderTransfer()
 			r.logger.Infof("%x [term %d] abort previous transferring leadership to %x", r.id, r.Term, lastLeadTransferee)
 		}
@@ -1480,12 +1487,15 @@ func stepLeader(r *raft, m pb.Message) error {
 		// Transfer leadership to third party.
 		r.logger.Infof("%x [term %d] starts to transfer leadership to %x", r.id, r.Term, leadTransferee)
 		// Transfer leadership should be finished in one electionTimeout, so reset r.electionElapsed.
+		// 限制：leader转移必须在一次选举超时时间内完成，否则认为失败。所以直接重置计时器
 		r.electionElapsed = 0
 		r.leadTransferee = leadTransferee
 		if pr.Match == r.raftLog.lastIndex() {
+			// 如果目标节点的日志与当前节点一致，发送MsgTimeoutNow，follower可以直接发起选举
 			r.sendTimeoutNow(leadTransferee)
 			r.logger.Infof("%x sends MsgTimeoutNow to %x immediately as %x already has up-to-date log", r.id, leadTransferee, leadTransferee)
 		} else {
+			// 向follower发起msgApp消息进行复制
 			r.sendAppend(leadTransferee)
 		}
 	}
@@ -1575,6 +1585,7 @@ func stepFollower(r *raft, m pb.Message) error {
 		r.lead = m.From
 		// 从snapshot中重建raft log
 		r.handleSnapshot(m)
+	// follower收到leader转移请求时，转发给leader
 	case pb.MsgTransferLeader:
 		if r.lead == None {
 			r.logger.Infof("%x no leader at term %d; dropping leader transfer msg", r.id, r.Term)
@@ -1582,6 +1593,7 @@ func stepFollower(r *raft, m pb.Message) error {
 		}
 		m.To = r.lead
 		r.send(m)
+	// follower数据和leader一致，可以直接发起选主
 	case pb.MsgTimeoutNow:
 		r.logger.Infof("%x [term %d] received MsgTimeoutNow from %x and starts an election to get leadership.", r.id, r.Term, m.From)
 		// Leadership transfers never use pre-vote even if r.preVote is true; we
