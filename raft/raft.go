@@ -44,6 +44,7 @@ const (
 	numStates
 )
 
+// 分成两类，safe代表必须收到半数以上心跳回复，才能回复这条读请求
 type ReadOnlyOption int
 
 const (
@@ -303,6 +304,7 @@ type raft struct {
 	// term changes.
 	uncommittedSize uint64
 
+	// 记录节点收到的读请求
 	readOnly *readOnly
 
 	// number of ticks since it reached last electionTimeout when it is leader
@@ -1165,9 +1167,11 @@ func stepLeader(r *raft, m pb.Message) error {
 		// leader已经处理完写请求，马上同步给所有的follower
 		r.bcastAppend()
 		return nil
+	// leader节点收到follower节点发来的读请求
 	case pb.MsgReadIndex:
 		// only one voting member (the leader) in the cluster
 		if r.prs.IsSingleton() {
+			// 如果从别的节点收到，返回一条MsgReadIndexResp，index是leader已提交的索引
 			if resp := r.responseToReadIndexReq(m, r.raftLog.committed); resp.To != None {
 				r.send(resp)
 			}
@@ -1177,6 +1181,7 @@ func stepLeader(r *raft, m pb.Message) error {
 		// Postpone read only request when this leader has not committed
 		// any log entry at its term.
 		if !r.committedEntryInCurrentTerm() {
+			// 在多leader的情况下，比如网络分区，如果读请求尚未被leader节点提交，加入pending message中
 			r.pendingReadIndexMessages = append(r.pendingReadIndexMessages, m)
 			return nil
 		}
@@ -1401,14 +1406,20 @@ func stepLeader(r *raft, m pb.Message) error {
 			r.sendAppend(m.From)
 		}
 
+		// 在心跳消息中，如果是读请求，发送心跳会带上消息的ID，response里同样携带消息的ID。
+		// 如果不是safe模式，不会进行后续处理；如果context（即ID）为空，说明只是一条普通心跳。
 		if r.readOnly.option != ReadOnlySafe || len(m.Context) == 0 {
 			return nil
 		}
 
+		// leader向所有节点广播，收到一个节点的回复，把读请求中的vote表进行修改，之后统计投票结果。也就是如果
+		// 集群有2*N-1个节点，收到第N个节点的回复的时候，vote结果终于为'won'，可以继续后面的处理
 		if r.prs.Voters.VoteResult(r.readOnly.recvAck(m.From, m.Context)) != quorum.VoteWon {
 			return nil
 		}
 
+		// 为什么要清理这条消息以及之前的所有消息呢？请不清理不是基于这个请求具体的payload，而是基于leader是否仍然
+		// 是有效的leader。如果这个时候确认了，说明之前的读请求就可以回复了，不需要一轮心跳确认一条消息
 		rss := r.readOnly.advance(m)
 		for _, rs := range rss {
 			if resp := r.responseToReadIndexReq(rs.req, rs.index); resp.To != None {
@@ -1572,6 +1583,7 @@ func stepFollower(r *raft, m pb.Message) error {
 		// know we are not recovering from a partition so there is no need for the
 		// extra round trip.
 		r.hup(campaignTransfer)
+	// follower不能处理读请求，转发给leader
 	case pb.MsgReadIndex:
 		if r.lead == None {
 			r.logger.Infof("%x no leader at term %d; dropping index reading msg", r.id, r.Term)
@@ -1579,6 +1591,7 @@ func stepFollower(r *raft, m pb.Message) error {
 		}
 		m.To = r.lead
 		r.send(m)
+	// 收到leader的读请求恢复，加入到readStates中，待其他模块处理，再返回给client
 	case pb.MsgReadIndexResp:
 		if len(m.Entries) != 1 {
 			r.logger.Errorf("%x invalid format of MsgReadIndexResp from %x, entries count: %d", r.id, m.From, len(m.Entries))
@@ -1953,6 +1966,7 @@ func sendMsgReadIndexResponse(r *raft, m pb.Message) {
 	// This would allow multiple reads to piggyback on the same message.
 	switch r.readOnly.option {
 	// If more than the local vote is needed, go through a full broadcast.
+	// safe的含义是leader此时一定是集群的leader，即广播一条心跳能收到半数以上的回复
 	case ReadOnlySafe:
 		r.readOnly.addRequest(r.raftLog.committed, m)
 		// The local node automatically acks the request.

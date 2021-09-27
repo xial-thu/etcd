@@ -27,19 +27,20 @@ type ReadState struct {
 }
 
 type readIndexStatus struct {
-	req   pb.Message
-	index uint64
+	req   pb.Message // 读请求的主体
+	index uint64     // 收到读请求时，leader对应的committed的值
 	// NB: this never records 'false', but it's more convenient to use this
 	// instead of a map[uint64]struct{} due to the API of quorum.VoteResult. If
 	// this becomes performance sensitive enough (doubtful), quorum.VoteResult
 	// can change to an API that is closer to that of CommittedIndex.
-	acks map[uint64]bool
+	acks map[uint64]bool // 心跳包的回复情况
 }
 
+// 节点收到的读请求
 type readOnly struct {
-	option           ReadOnlyOption
-	pendingReadIndex map[string]*readIndexStatus
-	readIndexQueue   []string
+	option           ReadOnlyOption              // 相应读请求的模式
+	pendingReadIndex map[string]*readIndexStatus // 尚未被处理的读请求
+	readIndexQueue   []string                    // 读请求的消息中的消息的ID
 }
 
 func newReadOnly(option ReadOnlyOption) *readOnly {
@@ -78,6 +79,7 @@ func (ro *readOnly) recvAck(id uint64, context []byte) map[uint64]bool {
 // advance advances the read only request queue kept by the readonly struct.
 // It dequeues the requests until it finds the read only request that has
 // the same context as the given `m`.
+// leader确认自己仍然是leader之后，可以可处理读请求了。读请求之前被加到数组里了，这里就要清空记录
 func (ro *readOnly) advance(m pb.Message) []*readIndexStatus {
 	var (
 		i     int
@@ -87,6 +89,7 @@ func (ro *readOnly) advance(m pb.Message) []*readIndexStatus {
 	ctx := string(m.Context)
 	rss := []*readIndexStatus{}
 
+	// 找ID对应的请求，这是FIFO的，所以用rss记录所有在这条请求之前的请求
 	for _, okctx := range ro.readIndexQueue {
 		i++
 		rs, ok := ro.pendingReadIndex[okctx]
@@ -100,6 +103,7 @@ func (ro *readOnly) advance(m pb.Message) []*readIndexStatus {
 		}
 	}
 
+	// 清理上面找到的请求
 	if found {
 		ro.readIndexQueue = ro.readIndexQueue[i:]
 		for _, rs := range rss {
