@@ -47,7 +47,9 @@ func (rn *RawNode) Bootstrap(peers []Peer) error {
 
 	// TODO(tbg): remove StartNode and give the application the right tools to
 	// bootstrap the initial membership in a cleaner way.
+	// 一开始节点的任期值都是1，没有给任何节点投过票
 	rn.raft.becomeFollower(1, None)
+	// 初始化entry，加入一些conf change的消息，每个节点一个conf change，代表这个节点加入集群
 	ents := make([]pb.Entry, len(peers))
 	for i, peer := range peers {
 		cc := pb.ConfChange{Type: pb.ConfChangeAddNode, NodeID: peer.ID, Context: peer.Context}

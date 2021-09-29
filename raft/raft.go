@@ -583,6 +583,8 @@ func (r *raft) bcastHeartbeatWithCtx(ctx []byte) {
 	})
 }
 
+// 这里居然引用了node.go的内容，不是特别理解，因为raft结构体是node的底层结构，这里有点依赖倒置了
+// 等于是raft上报了一个ready状态，上层node调用了raft的advance方法，修改raft自己的数据结构
 func (r *raft) advance(rd Ready) {
 	r.reduceUncommittedSize(rd.CommittedEntries)
 
@@ -590,10 +592,13 @@ func (r *raft) advance(rd Ready) {
 	// the next Ready. Note that if the current HardState contains a
 	// new Commit index, this does not mean that we're also applying
 	// all of the new entries due to commit pagination by size.
+	// ready状态中的committed索引是已应用的，即认为上层处理完committed的数据，这些就是
+	// applied，相应的回到raft中要记录这些数据已经被上层处理完了，方式就是更新applied索引
 	if newApplied := rd.appliedCursor(); newApplied > 0 {
 		oldApplied := r.raftLog.applied
 		r.raftLog.appliedTo(newApplied)
 
+		// 处理conf change
 		if r.prs.Config.AutoLeave && oldApplied <= r.pendingConfIndex && newApplied >= r.pendingConfIndex && r.state == StateLeader {
 			// If the current (and most recent, at least for this leader's term)
 			// configuration should be auto-left, initiate that now. We use a
@@ -613,10 +618,12 @@ func (r *raft) advance(rd Ready) {
 		}
 	}
 
+	// 将ready的记录持久化，这么看来，ready其实处理的是unstable中的内容，交给上层处理，上层应当将他们持久化
 	if len(rd.Entries) > 0 {
 		e := rd.Entries[len(rd.Entries)-1]
 		r.raftLog.stableTo(e.Index, e.Term)
 	}
+	// 清空unstable中的快照记录
 	if !IsEmptySnap(rd.Snapshot) {
 		r.raftLog.stableSnapTo(rd.Snapshot.Metadata.Index)
 	}
