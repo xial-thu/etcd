@@ -426,15 +426,18 @@ func (n *node) run() {
 					for _, id := range sl {
 						if id == r.id {
 							found = true
+							// 神奇的用法
 							break outer
 						}
 					}
 				}
+				// 如果之前在，现在不在，将prop channel置为空，禁止接受msgProp消息
 				if !found {
 					propc = nil
 				}
 			}
 			select {
+			// 将conf state写入conf state channel中，通知上层目前的节点统计情况
 			case n.confstatec <- cs:
 			case <-n.done:
 			}

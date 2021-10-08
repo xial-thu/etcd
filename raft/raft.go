@@ -1786,6 +1786,13 @@ func (r *raft) promotable() bool {
 	return pr != nil && !pr.IsLearner && !r.raftLog.hasPendingSnapshot()
 }
 
+// conf change分为两种类型的消息：simple和joint。simple的意思是一次接收一个节点的变化，例如原来有A、B、C三个节点，现在有D、E两个节点
+// 要加入，这时候会有两个simple的conf change，第一个是D加入，第二个是E加入，raft会分别处理这两条消息。simple的方式总能奏效，但是一次只能处理
+// 一个节点，如果一下有大量节点要变更，可能会造成效率低下。如果一次处理多个节点呢？用simple的方式会有问题，比如A、B、C同时加入D、E之后，5个节点，
+// quorum为3，某个时刻B和A失联，B发起选举，D和E投票给B，B就成为了leader，但其实A可能依然满足当leader的条件。所以为了避免这种corner case，
+// raft用joint configuration进行批量处理，一个joint configuration分为old和new两份配置，一个节点的删除和添加，比如D-old和D-new，会同时在
+// raft中起作用。log会被同时复制到old和new中的节点上，两份配置中节点都可能被选为leader，但只有 C-old 里面 majority 和 C-new 里面 majority
+// 都同意，才能选出 Leader 和进行 Log 提交。
 func (r *raft) applyConfChange(cc pb.ConfChangeV2) pb.ConfState {
 	cfg, prs, err := func() (tracker.Config, tracker.ProgressMap, error) {
 		changer := confchange.Changer{
