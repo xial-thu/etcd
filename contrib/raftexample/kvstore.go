@@ -27,6 +27,7 @@ import (
 
 // a key-value store backed by raft
 type kvstore struct {
+	// http API收到PUT请求时，将数据传入propose channel中，raft节点就知道有个写请求了
 	proposeC    chan<- string // channel for proposing updates
 	mu          sync.RWMutex
 	kvStore     map[string]string // current committed key-value pairs
