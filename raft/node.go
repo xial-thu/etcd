@@ -338,6 +338,7 @@ func (n *node) Stop() {
 	<-n.done
 }
 
+// run执行之后，raft内部状态机开始工作
 func (n *node) run() {
 	var propc chan msgWithResult
 	var readyc chan Ready
@@ -467,6 +468,7 @@ func (n *node) run() {
 
 // Tick increments the internal logical clock for this Node. Election timeouts
 // and heartbeat timeouts are in units of ticks.
+// 推进逻辑时钟，如果node已被关闭，啥也不干
 func (n *node) Tick() {
 	select {
 	case n.tickc <- struct{}{}:
@@ -476,8 +478,10 @@ func (n *node) Tick() {
 	}
 }
 
+// 发起选举，传递MsgHup消息
 func (n *node) Campaign(ctx context.Context) error { return n.step(ctx, pb.Message{Type: pb.MsgHup}) }
 
+// 处理写请求，也是调用step
 func (n *node) Propose(ctx context.Context, data []byte) error {
 	return n.stepWait(ctx, pb.Message{Type: pb.MsgProp, Entries: []pb.Entry{{Data: data}}})
 }
@@ -488,6 +492,7 @@ func (n *node) Step(ctx context.Context, m pb.Message) error {
 		// TODO: return an error?
 		return nil
 	}
+	// 调用step方法处理消息
 	return n.step(ctx, m)
 }
 
@@ -520,6 +525,7 @@ func (n *node) stepWait(ctx context.Context, m pb.Message) error {
 func (n *node) stepWithWaitOption(ctx context.Context, m pb.Message, wait bool) error {
 	if m.Type != pb.MsgProp {
 		select {
+		// 除了MsgProp之外的消息由这个channel接收
 		case n.recvc <- m:
 			return nil
 		case <-ctx.Done():
@@ -528,6 +534,7 @@ func (n *node) stepWithWaitOption(ctx context.Context, m pb.Message, wait bool) 
 			return ErrStopped
 		}
 	}
+	// 写请求封一条消息发送给prop channel
 	ch := n.propc
 	pm := msgWithResult{m: m}
 	if wait {
@@ -543,6 +550,7 @@ func (n *node) stepWithWaitOption(ctx context.Context, m pb.Message, wait bool) 
 	case <-n.done:
 		return ErrStopped
 	}
+	// 发送之后等待回复
 	select {
 	case err := <-pm.result:
 		if err != nil {
