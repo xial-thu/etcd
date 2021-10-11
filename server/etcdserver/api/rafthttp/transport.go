@@ -32,6 +32,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// raft状态机的抽象
 type Raft interface {
 	Process(ctx context.Context, m raftpb.Message) error
 	IsIDRemoved(id uint64) bool
@@ -42,32 +43,38 @@ type Raft interface {
 type Transporter interface {
 	// Start starts the given Transporter.
 	// Start MUST be called before calling other functions in the interface.
+	// 初始化操作
 	Start() error
 	// Handler returns the HTTP handler of the transporter.
 	// A transporter HTTP handler handles the HTTP requests
 	// from remote peers.
 	// The handler MUST be used to handle RaftPrefix(/raft)
 	// endpoint.
+	// 创建hander实例，关联到指定的URL上
 	Handler() http.Handler
 	// Send sends out the given messages to the remote peers.
 	// Each message has a To field, which is an id that maps
 	// to an existing peer in the transport.
 	// If the id cannot be found in the transport, the message
 	// will be ignored.
+	// 发送消息
 	Send(m []raftpb.Message)
 	// SendSnapshot sends out the given snapshot message to a remote peer.
 	// The behavior of SendSnapshot is similar to Send.
+	// 发送快照
 	SendSnapshot(m snap.Message)
 	// AddRemote adds a remote with given peer urls into the transport.
 	// A remote helps newly joined member to catch up the progress of cluster,
 	// and will not be used after that.
 	// It is the caller's responsibility to ensure the urls are all valid,
 	// or it panics.
+	// 集群新增节点时，已有节点都会调用这个函数，添加这个新加入的节点
 	AddRemote(id types.ID, urls []string)
 	// AddPeer adds a peer with given peer urls into the transport.
 	// It is the caller's responsibility to ensure the urls are all valid,
 	// or it panics.
 	// Peer urls are used to connect to the remote peer.
+	// peer是集群中当前节点对其他节点的称呼
 	AddPeer(id types.ID, urls []string)
 	// RemovePeer removes the peer with given id.
 	RemovePeer(id types.ID)
@@ -94,6 +101,7 @@ type Transporter interface {
 // received from peerURLs.
 // User needs to call Start before calling other functions, and call
 // Stop when the Transport is no longer used.
+// 和http.Transport是两码事
 type Transport struct {
 	Logger *zap.Logger
 
@@ -126,7 +134,7 @@ type Transport struct {
 	remotes map[types.ID]*remote // remotes map that helps newly joined member to catch up
 	peers   map[types.ID]Peer    // peers map
 
-	pipelineProber probing.Prober
+	pipelineProber probing.Prober // 用来探测消息通道是否可用
 	streamProber   probing.Prober
 }
 
@@ -142,6 +150,7 @@ func (t *Transport) Start() error {
 	}
 	t.remotes = make(map[types.ID]*remote)
 	t.peers = make(map[types.ID]Peer)
+	// 初始化探针
 	t.pipelineProber = probing.NewProber(t.pipelineRt)
 	t.streamProber = probing.NewProber(t.streamRt)
 
@@ -154,6 +163,11 @@ func (t *Transport) Start() error {
 	return nil
 }
 
+// 里面定义了三个处理函数，pipeline, stream, snap，都是标准的go http handler
+// /raft: pipeline handler
+// /raft/stream: stream handler
+// /raft/snapshot: snapshot handler
+// /raft/probing: health handler
 func (t *Transport) Handler() http.Handler {
 	pipelineHandler := newPipelineHandler(t, t.Raft, t.ClusterID)
 	streamHandler := newStreamHandler(t, t, t.Raft, t.ID, t.ClusterID)
@@ -172,6 +186,7 @@ func (t *Transport) Get(id types.ID) Peer {
 	return t.peers[id]
 }
 
+// 发送消息
 func (t *Transport) Send(msgs []raftpb.Message) {
 	for _, m := range msgs {
 		if m.To == 0 {
@@ -185,19 +200,23 @@ func (t *Transport) Send(msgs []raftpb.Message) {
 		g, rok := t.remotes[to]
 		t.mu.RUnlock()
 
+		// 如果存在peer实例，使用peer发送消息
 		if pok {
 			if m.Type == raftpb.MsgApp {
+				// 记录统计信息
 				t.ServerStats.SendAppendReq(m.Size())
 			}
 			p.send(m)
 			continue
 		}
 
+		// 如果存在remote实例，用remote发送消息
 		if rok {
 			g.send(m)
 			continue
 		}
 
+		// 节点在集群中没有记录，记录一下错误日志
 		if t.Logger != nil {
 			t.Logger.Debug(
 				"ignored message send request; unknown remote peer target",
@@ -292,13 +311,16 @@ func (t *Transport) AddRemote(id types.ID, us []string) {
 	}
 }
 
+// 添加集群中其他节点
 func (t *Transport) AddPeer(id types.ID, us []string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	// 看这里的注释，如果transport失效了，peer会被置空
 	if t.peers == nil {
 		panic("transport stopped")
 	}
+	// 如果已经建立过连接了，跳过即可
 	if _, ok := t.peers[id]; ok {
 		return
 	}
@@ -310,6 +332,7 @@ func (t *Transport) AddPeer(id types.ID, us []string) {
 	}
 	fs := t.LeaderStats.Follower(id.String())
 	t.peers[id] = startPeer(t, urls, id, fs)
+	// 将节点加入探针的探测范围
 	addPeerToProber(t.Logger, t.pipelineProber, id.String(), us, RoundTripperNameSnapshot, rttSec)
 	addPeerToProber(t.Logger, t.streamProber, id.String(), us, RoundTripperNameRaftMessage, rttSec)
 

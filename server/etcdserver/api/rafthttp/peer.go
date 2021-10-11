@@ -65,10 +65,12 @@ type Peer interface {
 	// and has no promise that the message will be received by the remote.
 	// When it fails to send message out, it will report the status to underlying
 	// raft.
+	// 重点：非阻塞，只在发送失败时报告
 	send(m raftpb.Message)
 
 	// sendSnap sends the merged snapshot message to the remote peer. Its behavior
 	// is similar to send.
+	// 与send的行为类似
 	sendSnap(m snap.Message)
 
 	// update updates the urls of remote peer.
@@ -109,6 +111,7 @@ type peer struct {
 
 	status *peerStatus
 
+	// 节点可能有多个URL，picker会选出可以通信的URL
 	picker *urlPicker
 
 	msgAppV2Writer *streamWriter
@@ -118,10 +121,13 @@ type peer struct {
 	msgAppV2Reader *streamReader
 	msgAppReader   *streamReader
 
+	// 从stream通道收到消息后，通过这个channel给raft接口，然后被转给raft模块
 	recvc chan raftpb.Message
+	// 从stream通道收到写请求后，通过这个channel给raft接口，然后被转给raft模块
 	propc chan raftpb.Message
 
-	mu     sync.Mutex
+	mu sync.Mutex
+	// 是否暂停向对应节点发送消息
 	paused bool
 
 	cancel context.CancelFunc // cancel pending works in go routine created by peer.
@@ -154,12 +160,13 @@ func startPeer(t *Transport, urls types.URLs, peerID types.ID, fs *stats.Followe
 	pipeline.start()
 
 	p := &peer{
-		lg:             t.Logger,
-		localID:        t.ID,
-		id:             peerID,
-		r:              r,
-		status:         status,
-		picker:         picker,
+		lg:      t.Logger,
+		localID: t.ID,
+		id:      peerID,
+		r:       r,
+		status:  status,
+		picker:  picker,
+		// 创建并启动stream writer
 		msgAppV2Writer: startStreamWriter(t.Logger, t.ID, peerID, status, fs, r),
 		writer:         startStreamWriter(t.Logger, t.ID, peerID, status, fs, r),
 		pipeline:       pipeline,
@@ -174,6 +181,7 @@ func startPeer(t *Transport, urls types.URLs, peerID types.ID, fs *stats.Followe
 	go func() {
 		for {
 			select {
+			// 从channel里读取消息，通过raft接口的process接口，交给底层的raft模块处理
 			case mm := <-p.recvc:
 				if err := r.Process(ctx, mm); err != nil {
 					if t.Logger != nil {
@@ -189,6 +197,7 @@ func startPeer(t *Transport, urls types.URLs, peerID types.ID, fs *stats.Followe
 	// r.Process might block for processing proposal when there is no leader.
 	// Thus propc must be put into a separate routine with recvc to avoid blocking
 	// processing other raft messages.
+	// 写请求可能因为leader节点失联而阻塞，但是raft节点不能因为这种情况而一直阻塞住，所以写请求和其他请求要分开
 	go func() {
 		for {
 			select {
@@ -244,7 +253,9 @@ func (p *peer) send(m raftpb.Message) {
 
 	writec, name := p.pick(m)
 	select {
+	// 把消息写入write channel中
 	case writec <- m:
+	// 如果阻塞了，将信息上报给底层的raft状态机
 	default:
 		p.r.ReportUnreachable(m.To)
 		if isMsgSnap(m) {

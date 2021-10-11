@@ -22,6 +22,7 @@ import (
 
 // stoppableListener sets TCP keep-alive timeouts on accepted
 // connections and waits on stopc message
+// 封装了tcp listener
 type stoppableListener struct {
 	*net.TCPListener
 	stopc <-chan struct{}
@@ -38,7 +39,9 @@ func newStoppableListener(addr string, stopc <-chan struct{}) (*stoppableListene
 func (ln stoppableListener) Accept() (c net.Conn, err error) {
 	connc := make(chan *net.TCPConn, 1)
 	errc := make(chan error, 1)
+	// 启动一个go rountine处理连接
 	go func() {
+		// 调用go net库的能力，返回一个tcp connection，加入到channel中
 		tc, err := ln.AcceptTCP()
 		if err != nil {
 			errc <- err
@@ -46,6 +49,7 @@ func (ln stoppableListener) Accept() (c net.Conn, err error) {
 		}
 		connc <- tc
 	}()
+	// 一旦接收到tcp连接，设置为3分钟的长连接
 	select {
 	case <-ln.stopc:
 		return nil, errors.New("server stopped")

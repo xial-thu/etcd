@@ -64,6 +64,7 @@ func (p *pipeline) start() {
 	p.stopc = make(chan struct{})
 	p.msgc = make(chan raftpb.Message, pipelineBufSize)
 	p.wg.Add(connPerPipeline)
+	// 有多个消息者从channel中读取消息
 	for i := 0; i < connPerPipeline; i++ {
 		go p.handle()
 	}
@@ -90,13 +91,16 @@ func (p *pipeline) stop() {
 	}
 }
 
+// 主要调用post方法把消息发送出去，之后向raft模块汇报发送结果
 func (p *pipeline) handle() {
 	defer p.wg.Done()
 
 	for {
 		select {
+		// 获取消息，注意这里的消息一定是snapshot
 		case m := <-p.msgc:
 			start := time.Now()
+			// 序列化后通过post接口发送
 			err := p.post(pbutil.MustMarshal(&m))
 			end := time.Now()
 
