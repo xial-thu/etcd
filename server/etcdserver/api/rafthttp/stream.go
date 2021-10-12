@@ -100,6 +100,7 @@ func isLinkHeartbeatMessage(m *raftpb.Message) bool {
 	return m.Type == raftpb.MsgHeartbeat && m.From == 0 && m.To == 0
 }
 
+// 对http连接的封装，记录了一些额外信息，比如协议版本等
 type outgoingConn struct {
 	t streamType
 	io.Writer
@@ -111,6 +112,7 @@ type outgoingConn struct {
 }
 
 // streamWriter writes messages to the attached outgoingConn.
+// 主要功能是向stream消息通道写入消息
 type streamWriter struct {
 	lg *zap.Logger
 
@@ -125,7 +127,9 @@ type streamWriter struct {
 	closer  io.Closer
 	working bool
 
-	msgc  chan raftpb.Message
+	// peer将消息写入通道，writer读取消息并真正发送
+	msgc chan raftpb.Message
+	// 获取关联的底层网络连接
 	connc chan *outgoingConn
 	stopc chan struct{}
 	done  chan struct{}
@@ -154,7 +158,8 @@ func startStreamWriter(lg *zap.Logger, local, id types.ID, status *peerStatus, f
 
 func (cw *streamWriter) run() {
 	var (
-		msgc       chan raftpb.Message
+		msgc chan raftpb.Message
+		// 这个心跳是为了避免长连接中断
 		heartbeatc <-chan time.Time
 		t          streamType
 		enc        encoder
@@ -175,10 +180,12 @@ func (cw *streamWriter) run() {
 
 	for {
 		select {
+		// 定时器到期的时候触发心跳消息
 		case <-heartbeatc:
 			err := enc.encode(&linkHeartbeatMessage)
 			unflushed += linkHeartbeatMessage.Size()
 			if err == nil {
+				// 将缓存的消息发出
 				flusher.Flush()
 				batched = 0
 				sentBytes.WithLabelValues(cw.peerID.String()).Add(float64(unflushed))
@@ -189,6 +196,7 @@ func (cw *streamWriter) run() {
 			cw.status.deactivate(failureType{source: t.String(), action: "heartbeat"}, err.Error())
 
 			sentFailures.WithLabelValues(cw.peerID.String()).Inc()
+			// 检测到错误了，关闭stream writer，会导致底层连接的断开
 			cw.close()
 			if cw.lg != nil {
 				cw.lg.Warn(
@@ -198,6 +206,7 @@ func (cw *streamWriter) run() {
 					zap.String("remote-peer-id", cw.peerID.String()),
 				)
 			}
+			// 重置这些channel，不再发送消息
 			heartbeatc, msgc = nil, nil
 
 		case m := <-msgc:
@@ -231,9 +240,12 @@ func (cw *streamWriter) run() {
 			cw.r.ReportUnreachable(m.To)
 			sentFailures.WithLabelValues(cw.peerID.String()).Inc()
 
+		// 其他节点主动与当前节点创建stream消息通道时，会先通过stream handler处理，stream handler
+		// 会通过attch方法将连接写入connc通道，这里从通道里取出连接再做处理
 		case conn := <-cw.connc:
 			cw.mu.Lock()
 			closed := cw.closeUnlocked()
+			// t是消息的版本或者说类型，生成相应的encoder
 			t = conn.t
 			switch conn.t {
 			case streamTypeMsgAppV2:
@@ -257,6 +269,7 @@ func (cw *streamWriter) run() {
 			unflushed = 0
 			cw.status.activate()
 			cw.closer = conn.Closer
+			// 该stream writer进入运行状态
 			cw.working = true
 			cw.mu.Unlock()
 
@@ -278,6 +291,7 @@ func (cw *streamWriter) run() {
 					zap.String("remote-peer-id", cw.peerID.String()),
 				)
 			}
+			// 更新heartbeat channel和msg channel
 			heartbeatc, msgc = tickc.C, cw.msgc
 
 		case <-cw.stopc:
@@ -377,6 +391,7 @@ type streamReader struct {
 	done   chan struct{}
 }
 
+// 核心函数
 func (cr *streamReader) start() {
 	cr.done = make(chan struct{})
 	if cr.errorc == nil {
@@ -401,6 +416,7 @@ func (cr *streamReader) run() {
 	}
 
 	for {
+		// 尝试向对端节点发送一个请求，看是否可通信。如果可通信，认为建立了连接
 		rc, err := cr.dial(t)
 		if err != nil {
 			if err != errUnsupportedStreamType {
@@ -416,6 +432,7 @@ func (cr *streamReader) run() {
 					zap.String("remote-peer-id", cr.peerID.String()),
 				)
 			}
+			// 核心方法
 			err = cr.decodeLoop(rc, t)
 			if cr.lg != nil {
 				cr.lg.Warn(
@@ -463,7 +480,9 @@ func (cr *streamReader) run() {
 	}
 }
 
+// 处理其他节点消息的核心方法
 func (cr *streamReader) decodeLoop(rc io.ReadCloser, t streamType) error {
+	// 根据消息类型生成相应的decoder
 	var dec decoder
 	cr.mu.Lock()
 	switch t {
@@ -490,6 +509,7 @@ func (cr *streamReader) decodeLoop(rc io.ReadCloser, t streamType) error {
 
 	// gofail: labelRaftDropHeartbeat:
 	for {
+		// 解码请求
 		m, err := dec.decode()
 		if err != nil {
 			cr.mu.Lock()
@@ -517,6 +537,7 @@ func (cr *streamReader) decodeLoop(rc io.ReadCloser, t streamType) error {
 			continue
 		}
 
+		// 根据消息类型，建立receive channel，准备将消息投放到channel中
 		recvc := cr.recvc
 		if m.Type == raftpb.MsgProp {
 			recvc = cr.propc
@@ -561,6 +582,7 @@ func (cr *streamReader) stop() {
 	<-cr.done
 }
 
+// 发送一个GET请求，看是否能连接上对端，通过picker管理候选url的active情况
 func (cr *streamReader) dial(t streamType) (io.ReadCloser, error) {
 	u := cr.picker.pick()
 	uu := u

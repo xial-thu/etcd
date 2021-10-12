@@ -100,6 +100,12 @@ type Peer interface {
 // to the remote follower node.
 // A pipeline is a series of http clients that send http requests to the remote.
 // It is only used when the stream has not been established.
+// 总结一下raft网络模块的工作模式。底层的raft状态机不停运作，底层的网络连接得以复用。网络模块
+// 使用若干个channel构建状态机到网络连接的桥梁。这些channel又被三个主要模块分类，分别是stream
+// reader, pipeline, stream writer，其中reader负责接收其他节点发来的请求，交给状态机处理；
+// pipeline负责处理向其他节点发起的快照请求；writer负责处理向其他节点发起的请求，同时有一个特殊的
+// channel叫connc，网络连接被通过connc被传递到http模块（stream writer），这样writer就感知到
+// 需要通过哪个连接发送网络请求
 type peer struct {
 	lg *zap.Logger
 
@@ -298,6 +304,7 @@ func (p *peer) update(urls types.URLs) {
 	p.picker.update(urls)
 }
 
+// 将连接写入stream writer的channel中，stream writer就可以感知到这个网络连接了
 func (p *peer) attachOutgoingConn(conn *outgoingConn) {
 	var ok bool
 	switch conn.t {
