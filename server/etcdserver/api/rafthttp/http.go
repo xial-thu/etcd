@@ -65,6 +65,7 @@ type writerToResponse interface {
 	WriteTo(w http.ResponseWriter)
 }
 
+// 处理对端节点发来的snapshot
 type pipelineHandler struct {
 	lg      *zap.Logger
 	localID types.ID
@@ -92,6 +93,7 @@ func newPipelineHandler(t *Transport, r Raft, cid types.ID) http.Handler {
 	return h
 }
 
+// 虽然叫serveHTTP，实际上是一个http handler
 func (h *pipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		w.Header().Set("Allow", "POST")
@@ -110,7 +112,9 @@ func (h *pipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Limit the data size that could be read from the request body, which ensures that read from
 	// connection will not time out accidentally due to possible blocking in underlying implementation.
+	// 每次读取部分数据，因为快照可能非常大，一下子读所有数据，很可能超时
 	limitedr := pioutil.NewLimitedBufferReader(r.Body, connReadLimitByte)
+	// 分批读取的实现全部交给go的标准库了
 	b, err := ioutil.ReadAll(limitedr)
 	if err != nil {
 		h.lg.Warn(
@@ -123,6 +127,7 @@ func (h *pipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 读取完数据之后，反序列化并封装为raft消息
 	var m raftpb.Message
 	if err := m.Unmarshal(b); err != nil {
 		h.lg.Warn(
@@ -137,6 +142,7 @@ func (h *pipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	receivedBytes.WithLabelValues(types.ID(m.From).String()).Add(float64(len(b)))
 
+	// 调用raft状态机进行处理
 	if err := h.r.Process(context.TODO(), m); err != nil {
 		switch v := err.(type) {
 		case writerToResponse:
@@ -157,6 +163,7 @@ func (h *pipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Write StatusNoContent header after the message has been processed by
 	// raft, which facilitates the client to report MsgSnap status.
+	// 成功的话，返回204
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -321,6 +328,7 @@ func (h *snapshotHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	snapshotReceiveSeconds.WithLabelValues(from).Observe(time.Since(start).Seconds())
 }
 
+// 收到对端的网络连接后，与stream writer实例进行关联
 type streamHandler struct {
 	lg         *zap.Logger
 	tr         *Transport
@@ -345,6 +353,7 @@ func newStreamHandler(t *Transport, pg peerGetter, r Raft, id, cid types.ID) htt
 	return h
 }
 
+// 同样也是http handler
 func (h *streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		w.Header().Set("Allow", "GET")
@@ -400,6 +409,7 @@ func (h *streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "removed member", http.StatusGone)
 		return
 	}
+	// 根据对端节点的ID，获取peer实例
 	p := h.peerGetter.Get(from)
 	if p == nil {
 		// This may happen in following cases:
@@ -439,6 +449,7 @@ func (h *streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.(http.Flusher).Flush()
 
 	c := newCloseNotifier()
+	// 封装网络连接
 	conn := &outgoingConn{
 		t:       t,
 		Writer:  w,
@@ -447,6 +458,7 @@ func (h *streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		localID: h.tr.ID,
 		peerID:  from,
 	}
+	// 通过peer的connc传递到stream writer中
 	p.attachOutgoingConn(conn)
 	<-c.closeNotify()
 }

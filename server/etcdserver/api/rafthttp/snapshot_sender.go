@@ -38,8 +38,8 @@ var (
 )
 
 type snapshotSender struct {
-	from, to types.ID
-	cid      types.ID
+	from, to types.ID // 当前节点与目标节点的ID
+	cid      types.ID // 集群ID
 
 	tr     *Transport
 	picker *urlPicker
@@ -66,6 +66,7 @@ func newSnapshotSender(tr *Transport, picker *urlPicker, to types.ID, status *pe
 
 func (s *snapshotSender) stop() { close(s.stopc) }
 
+// 核心方法
 func (s *snapshotSender) send(merged snap.Message) {
 	start := time.Now()
 
@@ -95,6 +96,7 @@ func (s *snapshotSender) send(merged snap.Message) {
 		snapshotSendInflights.WithLabelValues(to).Dec()
 	}()
 
+	// 前面已经准备好消息了，这里发送出去
 	err := s.post(req)
 	defer merged.CloseWithError(err)
 	if err != nil {
@@ -115,6 +117,7 @@ func (s *snapshotSender) send(merged snap.Message) {
 			reportCriticalError(err, s.errorc)
 		}
 
+		// 发送失败的话记录该url不可用，记录失败
 		s.picker.unreachable(u)
 		s.status.deactivate(failureType{source: sendSnap, action: "post"}, err.Error())
 		s.r.ReportUnreachable(m.To)
