@@ -70,6 +70,7 @@ var (
 // A newly created WAL is in append mode, and ready for appending records.
 // A just opened WAL is in read mode, and ready for reading records.
 // The WAL will be ready for appending after reading out all the previous records.
+// 上层模块收到待持久化的entry记录之后，先记录到WAL日志中，然后进行持久化操作
 type WAL struct {
 	lg *zap.Logger
 
@@ -78,9 +79,14 @@ type WAL struct {
 	// dirFile is a fd for the wal directory for syncing on Rename
 	dirFile *os.File
 
-	metadata []byte           // metadata recorded at the head of each WAL
-	state    raftpb.HardState // hardstate recorded at the head of WAL
+	// data字段记录了元数据，在每个WAL文件的开头，都会记录一条metadata type类型的日志记录，
+	// 这条记录就是这里的metadata
+	metadata []byte // metadata recorded at the head of each WAL
+	// WAL的追加是批量的，每次批量写入entryType的日志后，都会追加一条stateType的日志，在这里
+	// 记录了当前的任期、投票结果和已提交的日志位置
+	state raftpb.HardState // hardstate recorded at the head of WAL
 
+	// 每次读取WAL时，不会从头开始，而是从start字段指定的位置开始
 	start     walpb.Snapshot // snapshot to start reading
 	decoder   *decoder       // decoder to decode records
 	readClose func() error   // closer for decode reader
@@ -136,6 +142,7 @@ func Create(lg *zap.Logger, dirpath string, metadata []byte) (*WAL, error) {
 		)
 		return nil, err
 	}
+	// 找到文件的结尾处
 	if _, err = f.Seek(0, io.SeekEnd); err != nil {
 		lg.Warn(
 			"failed to seek an initial WAL file",
@@ -144,6 +151,7 @@ func Create(lg *zap.Logger, dirpath string, metadata []byte) (*WAL, error) {
 		)
 		return nil, err
 	}
+	// 预先分配64MB内存
 	if err = fileutil.Preallocate(f.File, SegmentSizeBytes, true); err != nil {
 		lg.Warn(
 			"failed to preallocate an initial WAL file",
@@ -164,17 +172,20 @@ func Create(lg *zap.Logger, dirpath string, metadata []byte) (*WAL, error) {
 		return nil, err
 	}
 	w.locks = append(w.locks, f)
+	// 创建一条CRC type类型的日志，即每一次初始化，第一条总是CRC校验
 	if err = w.saveCrc(0); err != nil {
 		return nil, err
 	}
 	if err = w.encoder.encode(&walpb.Record{Type: metadataType, Data: metadata}); err != nil {
 		return nil, err
 	}
+	// 创建一条空的snapshot记录写入文件中
 	if err = w.SaveSnapshot(walpb.Snapshot{}); err != nil {
 		return nil, err
 	}
 
 	logDirPath := w.dir
+	// 重命名，整个过程就是一次原子操作
 	if w, err = w.renameWAL(tmpdirpath); err != nil {
 		lg.Warn(
 			"failed to rename the temporary WAL directory",
@@ -216,6 +227,7 @@ func Create(lg *zap.Logger, dirpath string, metadata []byte) (*WAL, error) {
 		return nil
 	}
 	start := time.Now()
+	// 落盘
 	if perr = fileutil.Fsync(pdir); perr != nil {
 		dirCloser()
 		lg.Warn(
@@ -325,6 +337,7 @@ func OpenForRead(lg *zap.Logger, dirpath string, snap walpb.Snapshot) (*WAL, err
 	return openAtIndex(lg, dirpath, snap, false)
 }
 
+// 打开日志文件，snap.Index制订了日志读取的起始位置
 func openAtIndex(lg *zap.Logger, dirpath string, snap walpb.Snapshot, write bool) (*WAL, error) {
 	if lg == nil {
 		lg = zap.NewNop()
@@ -537,6 +550,7 @@ func (w *WAL) ReadAll() (metadata []byte, state raftpb.HardState, ents []raftpb.
 
 	if w.tail() != nil {
 		// create encoder (chain crc with the decoder), enable appending
+		// 只有读取了所有的日志记录之后，encoder才会初始化，才能继续写入新的日志
 		w.encoder, err = newFileEncoder(w.tail().File, w.decoder.lastCRC())
 		if err != nil {
 			return
@@ -888,6 +902,7 @@ func (w *WAL) Close() error {
 	return w.dirFile.Close()
 }
 
+// 对每个entry，封装一条entryType日志，通过encoder写入
 func (w *WAL) saveEntry(e *raftpb.Entry) error {
 	// TODO: add MustMarshalTo to reduce one allocation.
 	b := pbutil.MustMarshal(e)

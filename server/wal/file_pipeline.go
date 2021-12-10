@@ -25,21 +25,26 @@ import (
 )
 
 // filePipeline pipelines allocating disk space
+// 负责创建新的临时文件
 type filePipeline struct {
 	lg *zap.Logger
 
 	// dir to put files
 	dir string
 	// size of files to make, in bytes
+	// 创建临时文件时，预分配的大小
 	size int64
 	// count number of files generated
 	count int
 
+	// 创建的临时文件的句柄通过filec传递给WAL结构体
 	filec chan *fileutil.LockedFile
 	errc  chan error
+	// 通知pipeline删除最后一次创建的临时文件
 	donec chan struct{}
 }
 
+// 除了新建，还会运行
 func newFilePipeline(lg *zap.Logger, dir string, fileSize int64) *filePipeline {
 	if lg == nil {
 		lg = zap.NewNop()
@@ -58,6 +63,7 @@ func newFilePipeline(lg *zap.Logger, dir string, fileSize int64) *filePipeline {
 
 // Open returns a fresh file for writing. Rename the file before calling
 // Open again or there will be file collisions.
+// 供上层调用，在切换临时文件时
 func (fp *filePipeline) Open() (f *fileutil.LockedFile, err error) {
 	select {
 	case f = <-fp.filec:
